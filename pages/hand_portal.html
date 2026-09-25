@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hand Portal</title>
+    <link rel="icon" href="data:," />
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #000;
+        overflow: hidden;
+        font: 14px/1.4 ui-sans-serif, system-ui, sans-serif;
+        color: #fff;
+      }
+      video {
+        display: none;
+      }
+      canvas {
+        width: 100vw;
+        height: 100vh;
+        object-fit: cover;
+        display: block;
+      }
+      #hud {
+        position: fixed;
+        left: 16px;
+        right: 16px;
+        bottom: 16px;
+        display: flex;
+        gap: 12px;
+        align-items: baseline;
+        text-shadow: 0 1px 3px #000;
+      }
+      #filter {
+        font-weight: 700;
+        font-size: 18px;
+        white-space: nowrap;
+      }
+      #status {
+        opacity: 0.75;
+      }
+      #status.error {
+        color: #ff6b6b;
+        opacity: 1;
+      }
+    </style>
+  </head>
+  <body>
+    <video id="video" playsinline muted></video>
+    <canvas id="out"></canvas>
+    <div id="hud"><span id="filter"></span><span id="status">Загружаю модель и камеру…</span></div>
+    <script type="module">
+      import { FilesetResolver, HandLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/vision_bundle.mjs";
+
+      // --- geometry ---
+      const WRIST = 0;
+      const THUMB_TIP = 4;
+      const INDEX_TIP = 8;
+      const MIDDLE_MCP = 9;
+      const FINGERTIPS = [4, 8, 12, 16, 20];
+      const BUNCH_RATIO = 0.45;
+
+      const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+      // MediaPipe landmarks are normalized to the raw camera frame; the view is mirrored like a selfie.
+      const toMirroredPixels = (landmarks, width, height) =>
+        landmarks.map((p) => ({ x: (1 - p.x) * width, y: p.y * height }));
+
+      const sortLeftToRight = (hands) => [...hands].sort((a, b) => a[WRIST].x - b[WRIST].x);
+
+      const smoothHands = (prev, next, alpha) =>
+        prev.length !== next.length
+          ? next
+          : next.map((hand, h) =>
+              hand.map((p, i) => ({
+                x: prev[h][i].x + (p.x - prev[h][i].x) * alpha,
+                y: prev[h][i].y + (p.y - prev[h][i].y) * alpha,
+              })),
+            );
+
+      // Quad spanned by both "L" gestures: index tips on top, thumb tips at the bottom.
+      const portalQuad = ([left, right]) => [
+        left[INDEX_TIP],
+        right[INDEX_TIP],
+        right[THUMB_TIP],
+        left[THUMB_TIP],
+      ];
+
+      // All five fingertips pinched together around their centroid.
+      const isBunched = (hand) => {
+        const tips = FINGERTIPS.map((i) => hand[i]);
+        const center = {
+          x: tips.reduce((s, p) => s + p.x, 0) / tips.length,
+          y: tips.reduce((s, p) => s + p.y, 0) / tips.length,
+        };
+        const handSize = dist(hand[WRIST], hand[MIDDLE_MCP]);
+        return tips.every((p) => dist(p, center) < handSize * BUNCH_RATIO);
+      };
+
+      // --- filters ---
+      const FILTERS = ["Thermal", "Violet", "Sketch", "Mono", "Pixel", "Ocean", "Invert", "Sepia"];
+
+      const VERTEX = `
+      attribute vec2 a_pos;
+      varying vec2 v_uv;
+      void main() {
+        // Mirror horizontally to match the selfie view; texture row 0 is the top of the frame.
+        v_uv = vec2(0.5 - 0.5 * a_pos.x, 0.5 - 0.5 * a_pos.y);
+        gl_Position = vec4(a_pos, 0.0, 1.0);
+      }`;
+
+      const FRAGMENT = `
+      precision mediump float;
+      uniform sampler2D u_tex;
+      uniform vec2 u_texel;
+      uniform int u_mode;
+      varying vec2 v_uv;
+
+      float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+      float lumaAt(vec2 uv) { return luma(texture2D(u_tex, uv).rgb); }
+
+      vec3 jet(float t) {
+        return clamp(vec3(1.5 - abs(4.0 * t - 3.0), 1.5 - abs(4.0 * t - 2.0), 1.5 - abs(4.0 * t - 1.0)), 0.0, 1.0);
+      }
+
+      float sobel(vec2 uv) {
+        vec2 d = u_texel * 1.5;
+        float tl = lumaAt(uv + vec2(-d.x, -d.y)), t = lumaAt(uv + vec2(0.0, -d.y)), tr = lumaAt(uv + vec2(d.x, -d.y));
+        float l = lumaAt(uv + vec2(-d.x, 0.0)), r = lumaAt(uv + vec2(d.x, 0.0));
+        float bl = lumaAt(uv + vec2(-d.x, d.y)), b = lumaAt(uv + vec2(0.0, d.y)), br = lumaAt(uv + vec2(d.x, d.y));
+        float gx = tr + 2.0 * r + br - tl - 2.0 * l - bl;
+        float gy = bl + 2.0 * b + br - tl - 2.0 * t - tr;
+        return length(vec2(gx, gy));
+      }
+
+      void main() {
+        vec3 c = texture2D(u_tex, v_uv).rgb;
+        float y = luma(c);
+        vec3 o;
+        if (u_mode == 0) o = jet(y);
+        else if (u_mode == 1) o = mix(c, vec3(0.42, 0.04, 0.58), 0.72);
+        else if (u_mode == 2) o = vec3(1.0 - smoothstep(0.08, 0.5, sobel(v_uv)));
+        else if (u_mode == 3) o = vec3(y);
+        else if (u_mode == 4) {
+          vec2 block = u_texel * 18.0;
+          o = texture2D(u_tex, (floor(v_uv / block) + 0.5) * block).rgb;
+        }
+        else if (u_mode == 5) o = mix(vec3(0.0, 0.12, 0.28), vec3(0.65, 1.0, 1.0), y);
+        else if (u_mode == 6) o = 1.0 - c;
+        else o = vec3(dot(c, vec3(0.393, 0.769, 0.189)), dot(c, vec3(0.349, 0.686, 0.168)), dot(c, vec3(0.272, 0.534, 0.131)));
+        gl_FragColor = vec4(clamp(o, 0.0, 1.0), 1.0);
+      }`;
+
+      const compile = (gl, type, source) => {
+        const shader = gl.createShader(type);
+        gl.shaderSource(shader, source);
+        gl.compileShader(shader);
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(shader));
+        return shader;
+      };
+
+      // Renders the whole mirrored video frame through the selected filter into an offscreen canvas.
+      function createFilterRenderer(width, height) {
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        const gl = canvas.getContext("webgl");
+        if (!gl) throw new Error("WebGL is not available");
+
+        const program = gl.createProgram();
+        gl.attachShader(program, compile(gl, gl.VERTEX_SHADER, VERTEX));
+        gl.attachShader(program, compile(gl, gl.FRAGMENT_SHADER, FRAGMENT));
+        gl.linkProgram(program);
+        if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
+        gl.useProgram(program);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+        const aPos = gl.getAttribLocation(program, "a_pos");
+        gl.enableVertexAttribArray(aPos);
+        gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+        gl.bindTexture(gl.TEXTURE_2D, gl.createTexture());
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+        gl.uniform2f(gl.getUniformLocation(program, "u_texel"), 1 / width, 1 / height);
+        const uMode = gl.getUniformLocation(program, "u_mode");
+        gl.viewport(0, 0, width, height);
+
+        return {
+          canvas,
+          render(video, mode) {
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, video);
+            gl.uniform1i(uMode, mode);
+            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+          },
+        };
+      }
+
+      // --- app ---
+
+      const WASM_ROOT = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/wasm";
+      const MODEL_URL =
+        "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+      const SMOOTHING = 0.55;
+
+      const video = document.getElementById("video");
+      const out = document.getElementById("out");
+      const ctx = out.getContext("2d");
+      const filterLabel = document.getElementById("filter");
+      const statusLabel = document.getElementById("status");
+
+      let filterIndex = 0;
+      const setFilter = (i) => {
+        filterIndex = (i + FILTERS.length) % FILTERS.length;
+        filterLabel.textContent = `${filterIndex + 1}/${FILTERS.length} · ${FILTERS[filterIndex]}`;
+      };
+
+      async function createLandmarker() {
+        const fileset = await FilesetResolver.forVisionTasks(WASM_ROOT);
+        return HandLandmarker.createFromOptions(fileset, {
+          baseOptions: { modelAssetPath: MODEL_URL, delegate: "GPU" },
+          runningMode: "VIDEO",
+          numHands: 2,
+        });
+      }
+
+      async function openCamera() {
+        video.srcObject = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
+          audio: false,
+        });
+        await video.play();
+      }
+
+      function drawPortal(quad, filter) {
+        filter.render(video, filterIndex);
+        ctx.save();
+        ctx.beginPath();
+        quad.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
+        ctx.closePath();
+        ctx.clip();
+        ctx.drawImage(filter.canvas, 0, 0);
+        ctx.restore();
+        ctx.lineWidth = Math.max(2, out.width / 500);
+        ctx.strokeStyle = "rgba(255, 255, 255, 0.85)";
+        ctx.stroke();
+      }
+
+      function run(landmarker, filter) {
+        const { width, height } = out;
+        let hands = [];
+        let wasBunched = false;
+        let lastVideoTime = -1;
+
+        const frame = () => {
+          if (video.currentTime !== lastVideoTime) {
+            lastVideoTime = video.currentTime;
+            const { landmarks } = landmarker.detectForVideo(video, performance.now());
+            const detected = sortLeftToRight(landmarks.map((l) => toMirroredPixels(l, width, height)));
+            hands = smoothHands(hands, detected, SMOOTHING);
+            const bunched = hands.some(isBunched);
+            if (bunched && !wasBunched) setFilter(filterIndex + 1);
+            wasBunched = bunched;
+          }
+
+          ctx.save();
+          ctx.setTransform(-1, 0, 0, 1, width, 0);
+          ctx.drawImage(video, 0, 0, width, height);
+          ctx.restore();
+          if (hands.length === 2 && !wasBunched) drawPortal(portalQuad(hands), filter);
+
+          requestAnimationFrame(frame);
+        };
+        requestAnimationFrame(frame);
+      }
+
+      async function start() {
+        setFilter(0);
+        const [landmarker] = await Promise.all([createLandmarker(), openCamera()]);
+        out.width = video.videoWidth;
+        out.height = video.videoHeight;
+        statusLabel.textContent = "Покажи обе руки «рамкой» · щепоть всеми пальцами или ←/→ — сменить фильтр";
+        run(landmarker, createFilterRenderer(out.width, out.height));
+      }
+
+      addEventListener("keydown", (e) => {
+        if (e.key === "ArrowRight" || e.key === " ") setFilter(filterIndex + 1);
+        if (e.key === "ArrowLeft") setFilter(filterIndex - 1);
+      });
+
+      start().catch((error) => {
+        console.error(error);
+        statusLabel.textContent = `Ошибка: ${error.message ?? error}`;
+        statusLabel.classList.add("error");
+      });
+
+    </script>
+  </body>
+</html>
