@@ -231,11 +231,25 @@
         });
       }
 
+      // Browsers report camera failures with terse DOMException texts (Firefox: "The object can not be found here.").
+      const CAMERA_ERRORS = {
+        NotFoundError:
+          "Браузер не видит ни одной камеры. Проверь, что вебка подключена и что браузеру разрешена камера в системных настройках приватности (macOS/Windows).",
+        NotAllowedError:
+          "Доступ к камере запрещён. Разреши камеру для сайта (значок слева от адреса) и браузеру в системных настройках приватности.",
+        NotReadableError: "Камера занята другим приложением (Zoom, Meet, OBS…) или заблокирована системой.",
+      };
+
       async function openCamera() {
-        video.srcObject = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
-          audio: false,
-        });
+        try {
+          video.srcObject = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
+            audio: false,
+          });
+        } catch (error) {
+          const hint = CAMERA_ERRORS[error.name];
+          throw hint ? new Error(`${hint} (${error.name})`, { cause: error }) : error;
+        }
         await video.play();
       }
 
