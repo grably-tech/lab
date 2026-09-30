@@ -4,6 +4,7 @@ import { BONES, scenario } from "./synthetic.js";
 import {
   angleBetweenDeg,
   calibratePair,
+  focalFromFov,
   fovFromFocal,
   matMul,
   matVec,
@@ -67,6 +68,19 @@ describe("calibratePair on synthetic motion", () => {
       expect(medianMm).toBeLessThan(50);
     }, 60000);
   }
+
+  test("a remembered focal length is kept when it fits and corrected when it does not", () => {
+    const s = scenario({ angleDeg: 50, fovA: 70, fovB: 60, noisePx: 2, outlierRate: 0.05 });
+    const fov = (res) => [fovFromFocal(1280, res.camA.f), fovFromFocal(1920, res.camB.f)];
+    const withPrior = (fovA, fovB) => calibratePair(s.obs, s.sizeA, s.sizeB, { bones: BONES, reprojSigmaPx: 2, focalPrior: { fA: focalFromFov(1280, fovA), fB: focalFromFov(1920, fovB) } });
+    const right = fov(withPrior(70, 60));
+    const wrong = fov(withPrior(45, 90));
+    console.log(`prior 70/60 → ${right.map((v) => v.toFixed(1)).join("/")}, prior 45/90 → ${wrong.map((v) => v.toFixed(1)).join("/")}`);
+    expect(Math.abs(right[0] - 70)).toBeLessThan(2);
+    expect(Math.abs(right[1] - 60)).toBeLessThan(2);
+    expect(Math.abs(wrong[0] - 70)).toBeLessThan(5);
+    expect(Math.abs(wrong[1] - 60)).toBeLessThan(5);
+  }, 60000);
 
   // Narrow cameras are nearly affine: the depth-reflected scene explains the images almost as well as the true one.
   test("narrow cameras: keeps the solution whose handedness matches the 3D shapes, not its depth-reflected twin", () => {

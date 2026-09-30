@@ -105,8 +105,8 @@
           <label class="row">A <select id="liveA"></select></label>
           <label class="row">B <select id="liveB"></select></label>
           <button class="primary" id="liveOpen">Включить камеры</button>
-          <button class="primary" id="liveCalibrate" disabled>Калибровать (20 с движения)</button>
           <div class="progress"><div id="liveProgress"></div></div>
+          <button class="primary" id="liveReset" disabled>Сбросить калибровку</button>
           <div class="buttons">
             <button class="primary" id="liveExport">Экспорт калибровки</button>
             <button class="primary" id="liveImport">Импорт</button>
@@ -115,7 +115,7 @@
           <p class="hint" id="savedInfo"></p>
           <h2>Мимика</h2>
           <table id="expression"></table>
-          <p class="hint">Трекаются лицо и кисти. Во время калибровки води руками по всему кадру, ближе и дальше от камер, раскрывай и сжимай пальцы, поворачивай голову. Лицо и хотя бы одну кисть должны видеть обе камеры.</p>
+          <p class="hint">Трекаются лицо и кисти. Калибровка идёт сама, пока ты в кадре: ей нужно ~15 с, когда обе камеры видят лицо и руки, а руки ходят по кадру. Если камеру сдвинуть, это видно по кадрам — калибровка обновится сама. Фокусы камер запоминаются между сессиями и поправляются, если не сходятся. На iPhone выключи Center Stage: он зумит на ходу.</p>
         </div>
         <h2>Результат</h2>
         <table id="metrics"></table>
@@ -128,6 +128,7 @@
       import { calibratePair, fovFromFocal, matVec, median, project, reconstruct, rotationAngleDeg, transpose } from "./stereo.js";
       import { calibrationErrors, DATASETS, GT_SKELETONS, normalizeGt, oracleReconstruction, poseErrors } from "./eval.js";
       import { depthJitter, depthOffset, fuseFrame, groupDepths, groupsOf, monocularFrame, stereoDepths } from "./mono.js";
+      import { DRIFT_FRAMES, drift, frameReprojectionPx, MIN_FRAMES, MIN_SPREAD, readiness } from "./autocal.js";
       import { bodyPoints, calibrationFrames, emptyPoints, EXPRESSIONS, faceExpression, faceWidth, fillFace, OUTER_EYE_CORNERS_M, fillFaceShape, fillHands, handsWorld, hasAnyPoint, LAYOUTS, LEFT_HAND, mergeExpressions, RIGHT_HAND } from "./landmarks.js";
 
       const WASM_ROOT = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/wasm";
@@ -142,8 +143,11 @@
 
       const LIVE_LAYOUT = "faceHands";
       const LIVE_GROUPS = groupsOf(LAYOUTS[LIVE_LAYOUT]);
-      const LIVE_FRAMES = 200;
+      // Live frames seen by both cameras are sampled every LIVE_SAMPLE_MS into a rolling buffer of the last LIVE_BUFFER;
+      // a failed auto-calibration is retried after RETRY_FRAMES more.
       const LIVE_SAMPLE_MS = 100;
+      const LIVE_BUFFER = 300;
+      const RETRY_FRAMES = 50;
 
       const $ = (id) => document.getElementById(id);
       const statusEl = $("status");
@@ -508,15 +512,18 @@
         b: { label: $("liveB").selectedOptions[0]?.textContent ?? "", width: $("videoB").videoWidth, height: $("videoB").videoHeight },
       });
 
-      const buildRecord = (calib, view, cameras) => ({
+      // faceWidthUnits: stereo face width at calibration time (baseline units) — the metric scale and the reference for
+      // noticing a turned camera; null when the calibration saw no face.
+      const buildRecord = (calib, view, cameras, faceWidthUnits) => ({
         format: RECORD_FORMAT,
-        version: 1,
+        version: 2,
         createdAt: new Date().toISOString(),
         cameras,
         camA: calib.camA,
         camB: calib.camB,
         view,
         medianReprojPx: calib.medianReprojPx,
+        faceWidthUnits,
         log: calib.log,
       });
 
@@ -531,8 +538,9 @@
         const vec3 = (v) => Array.isArray(v) && v.length === 3 && v.every(num);
         const cam = (c) => c && num(c.f) && c.f > 0 && num(c.cx) && num(c.cy) && Array.isArray(c.R) && c.R.length === 3 && c.R.every(vec3) && vec3(c.t);
         const device = (d) => d && typeof d.label === "string" && num(d.width) && num(d.height);
-        if (r?.format !== RECORD_FORMAT || r.version !== 1) throw new Error("это не файл калибровки stereo-lab (или другая версия формата)");
-        if (!cam(r.camA) || !cam(r.camB) || !device(r.cameras?.a) || !device(r.cameras?.b) || !vec3(r.view?.center) || !num(r.view?.radius)) {
+        if (r?.format !== RECORD_FORMAT || r.version !== 2) throw new Error("это не файл калибровки stereo-lab (или другая версия формата)");
+        const faceWidthOk = r.faceWidthUnits === null || (num(r.faceWidthUnits) && r.faceWidthUnits > 0);
+        if (!cam(r.camA) || !cam(r.camB) || !device(r.cameras?.a) || !device(r.cameras?.b) || !vec3(r.view?.center) || !num(r.view?.radius) || !num(r.medianReprojPx) || !faceWidthOk) {
           throw new Error("файл калибровки повреждён: не хватает параметров камер");
         }
         return r;
@@ -544,6 +552,21 @@
       };
 
       const describeDevice = (d) => `${d.label} ${d.width}×${d.height}`;
+
+      // Focal length per device and resolution, remembered from accepted calibrations: a soft prior for the next one,
+      // which corrects it when the frames disagree (another lens, a zoomed stream).
+      const DEVICES_KEY = "stereo-lab.devices";
+      const loadDevices = () => JSON.parse(localStorage.getItem(DEVICES_KEY) ?? "{}");
+      const focalPrior = (cameras) => {
+        const devices = loadDevices();
+        return { fA: devices[describeDevice(cameras.a)]?.f, fB: devices[describeDevice(cameras.b)]?.f };
+      };
+      function rememberFocals(record) {
+        const devices = loadDevices();
+        devices[describeDevice(record.cameras.a)] = { f: record.camA.f, updatedAt: record.createdAt };
+        devices[describeDevice(record.cameras.b)] = { f: record.camB.f, updatedAt: record.createdAt };
+        localStorage.setItem(DEVICES_KEY, JSON.stringify(devices));
+      }
 
       // null when the record fits the open cameras, otherwise a human-readable reason.
       function recordMismatch(record, cameras) {
@@ -569,12 +592,15 @@
       }
 
       function applyRecord(record, source) {
-        live.calib = { camA: record.camA, camB: record.camB, log: record.log, medianReprojPx: record.medianReprojPx };
+        live.calib = { camA: record.camA, camB: record.camB, log: record.log, medianReprojPx: record.medianReprojPx, faceWidthUnits: record.faceWidthUnits };
         live.view = record.view;
         live.anchors = {};
         live.depths = { mono: [], stereo: [] };
         live.monoCenters = [];
-        live.faceWidths = [];
+        live.health = { errors: [], widths: [] };
+        live.drift = null;
+        live.checked = false;
+        $("liveProgress").style.width = "100%";
         const { camA, camB } = record;
         setMetrics([
           ["Калибровка", `${source}, ${new Date(record.createdAt).toLocaleString("ru")}`],
@@ -588,18 +614,28 @@
         faceCamera([0, 0, -1]);
       }
 
-      // Apply the stored calibration to the open cameras, or say why it does not fit.
+      // Apply the stored calibration to the open cameras (it is then checked against live frames), or say why it does not
+      // fit — auto-calibration takes over either way.
       function restoreSaved() {
         showSavedInfo();
-        const record = loadRecord();
-        if (!record) return false;
+        let record;
+        try {
+          record = loadRecord();
+        } catch (e) {
+          setStatus(`Сохранённая калибровка не читается (${e.message}) — калибруюсь заново.`);
+          return false;
+        }
+        if (!record) {
+          setStatus("Калибруюсь сама: встань так, чтобы тебя видели обе камеры, и подвигай руками.");
+          return false;
+        }
         const mismatch = recordMismatch(record, currentCameras());
         if (mismatch) {
-          setStatus(`Сохранённая калибровка не подходит (${mismatch}). Откалибруй заново или импортируй подходящую.`, true);
+          setStatus(`Сохранённая калибровка для других камер (${mismatch}) — калибруюсь заново.`);
           return false;
         }
         applyRecord(record, "сохранённая");
-        setStatus("Подхватил сохранённую калибровку. Если камеры сдвигались — откалибруй заново.");
+        setStatus("Подхватил сохранённую калибровку, проверяю её по кадрам…");
         return true;
       }
 
@@ -636,15 +672,20 @@
       // anchors: last stereo depth of each detection group per camera, for frames where only one camera sees it.
       // depths: recent per-group depths (camera A) for the jitter readout — mono in metres, stereo in baseline units.
       // monoCenters: recent centroids of the single-camera estimate (metres), to frame its panel.
-      const live = { streams: [], trackers: [], collected: [], calib: null, view: null, anchors: {}, depths: { mono: [], stereo: [] }, monoCenters: [], collecting: false, running: false };
+      // buffer/sampled: frames seen by both cameras for auto-calibration; request: id of the calibration in flight (null
+      // when none); health: per-frame reprojection errors and face widths under the current calibration; drift: set once
+      // they show a moved camera; checked: the current calibration has been confirmed by live frames.
+      const live = {
+        streams: [], trackers: [], calib: null, view: null, anchors: {}, depths: { mono: [], stereo: [] }, monoCenters: [], running: false,
+        buffer: [], sampled: 0, nextAttempt: 0, request: null, requests: 0, calibrationFrames: [], health: { errors: [], widths: [] }, drift: null, checked: false,
+      };
+      const calibWorker = new Worker("calib-worker.js", { type: "module" });
+      calibWorker.onmessage = ({ data }) => data.id === live.request && finishAutoCalibration(data);
       const JITTER_FRAMES = 30;
       const MONO_FRAMING_FRAMES = 60;
-      // Metric scale: stereo is in baseline units; the average face (outer eye corners) converts it to centimetres.
-      // faceWidths: recent stereo face widths in baseline units.
-      live.faceWidths = [];
-      const FACE_SCALE_FRAMES = 300;
-      const MIN_FACE_SAMPLES = 30;
-      const cmPerUnit = () => (live.faceWidths.length >= MIN_FACE_SAMPLES ? (OUTER_EYE_CORNERS_M * 100) / median(live.faceWidths) : null);
+      // Metric scale: stereo is in baseline units; the average face (outer eye corners) at calibration time converts it to
+      // centimetres.
+      const cmPerUnit = () => (live.calib?.faceWidthUnits ? (OUTER_EYE_CORNERS_M * 100) / live.calib.faceWidthUnits : null);
       // The tick runs at display rate, faster than cameras deliver frames; jitter is sampled only on new frames of camera A.
       live.framesA = 0;
       live.sampledFramesA = 0;
@@ -680,12 +721,11 @@
         $("labelA").textContent = `A · ${$("liveA").selectedOptions[0].textContent}`;
         $("labelB").textContent = `B · ${$("liveB").selectedOptions[0].textContent}`;
         live.trackers = await Promise.all([createTracker(LIVE_LAYOUT), createTracker(LIVE_LAYOUT)]);
+        resetAutoCalibration();
         live.calib = null;
         live.running = true;
-        $("liveCalibrate").disabled = false;
-        if (!restoreSaved()) {
-          if (!statusEl.classList.contains("error")) setStatus("Камеры включены. Встань так, чтобы тебя видели обе, и жми «Калибровать».");
-        }
+        $("liveReset").disabled = false;
+        restoreSaved();
         requestAnimationFrame(liveTick);
       }
 
@@ -696,12 +736,6 @@
         const [dA, dB] = videos.map((v, k) => live.trackers[k].detect(v, now));
         const det = [dA?.image ?? null, dB?.image ?? null];
         showExpression(mergeExpressions([dA?.expression, dB?.expression]));
-        if (live.collecting && dA && dB && now - (live.collected.at(-1)?.t ?? 0) >= LIVE_SAMPLE_MS) {
-          live.collected.push({ a: dA.image, b: dB.image, shapeA: dA.shape, shapeB: dB.shape, t: now });
-          $("liveProgress").style.width = `${(live.collected.length / LIVE_FRAMES) * 100}%`;
-          setStatus(`Собираю кадры: ${live.collected.length}/${LIVE_FRAMES} — двигайся`);
-          if (live.collected.length >= LIVE_FRAMES) finishLiveCalibration();
-        }
         let fused = null;
         if (live.calib && (dA || dB)) {
           const empty = emptyPoints(LAYOUTS[LIVE_LAYOUT].size);
@@ -709,8 +743,9 @@
           const recon = reconstruct([frame], live.calib)[0];
           Object.assign(live.anchors, stereoDepths(frame, recon, LIVE_GROUPS, live.calib));
           fused = fuseFrame(frame, recon, live.calib, live.anchors, LIVE_GROUPS);
-          const width = fused.source.face === "stereo" ? faceWidth(fused.points) : null;
-          if (width) live.faceWidths = [...live.faceWidths, width].slice(-FACE_SCALE_FRAMES);
+        }
+        if (dA && dB && now - (live.buffer.at(-1)?.t ?? 0) >= LIVE_SAMPLE_MS) {
+          sampleFrame({ a: dA.image, b: dB.image, shapeA: dA.shape, shapeB: dB.shape, t: now }, fused);
         }
         let mono = null;
         if (live.calib) mono = dA ? monocularFrame(dA.image, dA.shape, LIVE_GROUPS, live.calib.camA) : null;
@@ -732,25 +767,82 @@
         requestAnimationFrame(liveTick);
       }
 
-      function finishLiveCalibration() {
-        live.collecting = false;
-        const frames = live.collected;
+      const cameraSizes = () => [$("videoA"), $("videoB")].map((v) => ({ width: v.videoWidth, height: v.videoHeight }));
+
+      function resetAutoCalibration() {
+        live.buffer = [];
+        live.sampled = 0;
+        live.nextAttempt = 0;
+        live.request = null;
+        live.health = { errors: [], widths: [] };
+        live.drift = null;
+        live.checked = false;
+      }
+
+      // One frame seen by both cameras: into the buffer, checked against the current calibration, and maybe the trigger
+      // for an auto-calibration.
+      function sampleFrame(frame, fused) {
+        live.buffer = [...live.buffer, frame].slice(-LIVE_BUFFER);
+        live.sampled++;
+        if (live.calib) checkCalibration(frame, fused);
+        if (live.request === null && (!live.calib || live.drift) && live.sampled >= live.nextAttempt) maybeCalibrate();
+      }
+
+      function checkCalibration(frame, fused) {
+        const [calFrame] = calibrationFrames([frame], LAYOUTS[LIVE_LAYOUT]);
+        const errorPx = frameReprojectionPx(calFrame, live.calib);
+        const width = fused?.source.face === "stereo" ? faceWidth(fused.points) : null;
+        if (errorPx !== null) live.health.errors = [...live.health.errors, errorPx].slice(-DRIFT_FRAMES);
+        if (width) live.health.widths = [...live.health.widths, width].slice(-DRIFT_FRAMES);
+        const d = drift(live.health, live.calib);
+        if (d.drifted && !live.drift) {
+          live.drift = d;
+          // Frames from before the move describe the old camera placement.
+          live.buffer = [frame];
+          const why = [d.reprojection && `точки расходятся на ${d.errorPx.toFixed(1)} px при норме до ${d.limitPx.toFixed(1)}`, d.size && `лицо в 3D ${d.scale < 1 ? "сжалось" : "выросло"} на ${Math.abs((d.scale - 1) * 100).toFixed(0)}%`].filter(Boolean).join(", ");
+          setStatus(`Похоже, камеру сдвинули (${why}) — перекалибровываюсь, пока 3D по старой калибровке.`, true);
+        } else if (!live.checked && !live.drift && live.health.errors.length >= DRIFT_FRAMES) {
+          live.checked = true;
+          setStatus(`Калибровка сходится с кадрами: ${d.errorPx.toFixed(1)} px при пороге ${d.limitPx.toFixed(1)}${d.scale ? `, размер лица ${(d.scale * 100).toFixed(0)}%` : ""}.`);
+        }
+      }
+
+      function maybeCalibrate() {
         const layout = LAYOUTS[LIVE_LAYOUT];
-        const size = (v) => ({ width: v.videoWidth, height: v.videoHeight });
-        try {
-          live.calib = calibratePair(calibrationFrames(frames, layout), size($("videoA")), size($("videoB")), { bones: layout.bones, groups: layout.groups });
-        } catch (e) {
-          saveSession({ cameras: currentCameras(), layout: LIVE_LAYOUT, frames, error: e.message });
-          setStatus(`Калибровка не удалась: ${e.message}`, true);
+        const [sizeA, sizeB] = cameraSizes();
+        const frames = calibrationFrames(live.buffer, layout);
+        const r = readiness(frames, sizeA, sizeB);
+        $("liveProgress").style.width = `${r.progress * 100}%`;
+        if (!r.ready) {
+          if (!live.drift) setStatus(`Калибруюсь сама: кадров с лицом/руками в обеих камерах ${r.frames}/${MIN_FRAMES}, охват кадра ${(r.spread * 100).toFixed(0)}% из ${(MIN_SPREAD * 100).toFixed(0)}% — подвигай руками по кадру.`);
           return;
         }
-        const record = buildRecord(live.calib, viewFrame(reconstruct(frames, live.calib).flat()), currentCameras());
-        saveSession({ cameras: currentCameras(), layout: LIVE_LAYOUT, frames, record });
+        live.request = ++live.requests;
+        live.calibrationFrames = live.buffer;
+        const prior = focalPrior(currentCameras());
+        setStatus(`Калибруюсь по ${frames.length} кадрам${prior.fA || prior.fB ? " (с фокусами из прошлых сессий)" : ""}…`);
+        calibWorker.postMessage({ id: live.request, frames, sizeA, sizeB, options: { bones: layout.bones, groups: layout.groups, focalPrior: prior } });
+      }
+
+      function finishAutoCalibration({ calib, error }) {
+        live.request = null;
+        const frames = live.calibrationFrames;
+        const cameras = currentCameras();
+        if (error) {
+          saveSession({ cameras, layout: LIVE_LAYOUT, frames, error });
+          live.nextAttempt = live.sampled + RETRY_FRAMES;
+          setStatus(`Автокалибровка не удалась (${error}) — собираю ещё кадры и попробую снова.`, true);
+          return;
+        }
+        const recon = reconstruct(frames, calib);
+        const widths = recon.map(faceWidth).filter(Boolean);
+        const record = buildRecord(calib, viewFrame(recon.flat()), cameras, widths.length ? median(widths) : null);
+        saveSession({ cameras, layout: LIVE_LAYOUT, frames, record });
         localStorage.setItem(STORAGE_KEY, JSON.stringify(record));
+        rememberFocals(record);
         showSavedInfo();
-        applyRecord(record, "новая");
-        live.faceWidths = reconstruct(frames, live.calib).map(faceWidth).filter(Boolean).slice(-FACE_SCALE_FRAMES);
-        setStatus("Откалибровано и сохранено в браузере. 3D в реальном времени.");
+        applyRecord(record, "авто");
+        setStatus(`Откалибровано по ${frames.length} кадрам и сохранено; проверяю по новым кадрам…${record.faceWidthUnits ? "" : " Лица в кадрах не было — масштаб в см неизвестен."}`);
       }
 
       // Debug trail: the session goes to the lab server (tools/serve.ts) so a calibration can be replayed offline. Static
@@ -823,10 +915,19 @@
       }
 
       $("liveOpen").onclick = () => openCameras().catch((e) => setStatus(`Камеры: ${e.message}`, true));
-      $("liveCalibrate").onclick = () => {
+      $("liveReset").onclick = () => {
+        localStorage.removeItem(STORAGE_KEY);
+        resetAutoCalibration();
         live.calib = null;
-        live.collected = [];
-        live.collecting = true;
+        scene.redraw = null;
+        for (const canvas of [$("scene"), $("sceneMono")]) canvas.getContext("2d").clearRect(0, 0, canvas.width, canvas.height);
+        $("legend").textContent = "";
+        $("legendMono").textContent = "";
+        $("liveProgress").style.width = "0";
+        setMetrics([]);
+        logEl.textContent = "";
+        showSavedInfo();
+        setStatus("Калибровка сброшена — калибруюсь заново.");
       };
 
       // ---------- mode ----------

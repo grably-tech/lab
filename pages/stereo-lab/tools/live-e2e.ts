@@ -23,8 +23,10 @@ await page.route(/^https:\/\/(cdn\.jsdelivr\.net\/npm\/@mediapipe\/tasks-vision@
   return route.fulfill({ path: join(vendor, file), headers: { "access-control-allow-origin": "*", "content-type": type } });
 });
 await page.addInitScript(({ clips }) => {
-  const w = window as unknown as { __blank: Record<string, boolean> };
+  // __blank[id]: the camera sees nothing; __rollDeg[id]: the camera is rolled by that many degrees (a bumped camera).
+  const w = window as unknown as { __blank: Record<string, boolean>; __rollDeg: Record<string, number> };
   w.__blank = {};
+  w.__rollDeg = {};
   const devices = Object.keys(clips).map((id) => ({ deviceId: id, groupId: id, kind: "videoinput", label: `clip ${id}`, toJSON() {} }));
   const videos = new Map<string, HTMLVideoElement>();
   const clipVideo = (id: string) => {
@@ -46,7 +48,14 @@ await page.addInitScript(({ clips }) => {
     // Redraw only on new clip frames, so the stream carries the clip's real frame rate like a camera would.
     const draw = () => {
       if (w.__blank[id]) ctx.fillRect(0, 0, canvas.width, canvas.height);
-      else ctx.drawImage(video, 0, 0);
+      else {
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.translate(canvas.width / 2, canvas.height / 2);
+        ctx.rotate(((w.__rollDeg[id] ?? 0) * Math.PI) / 180);
+        ctx.drawImage(video, -canvas.width / 2, -canvas.height / 2);
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+      }
       video.requestVideoFrameCallback(draw);
     };
     draw();
@@ -71,10 +80,10 @@ await page.waitForFunction(() => document.querySelectorAll("#liveA option").leng
 await page.selectOption("#liveA", camA);
 await page.selectOption("#liveB", camB);
 await page.click("#liveOpen");
-await page.waitForFunction(() => /Камеры включены|Камеры:/.test(document.getElementById("status")!.textContent!), null, { timeout: 60000 });
+await page.waitForFunction(() => /Калибруюсь|Подхватил|Камеры:/.test(document.getElementById("status")!.textContent!), null, { timeout: 60000 });
 await page.evaluate(() => (window as unknown as { __startClips: () => void }).__startClips());
-await page.click("#liveCalibrate");
-await page.waitForFunction(() => /^Откалибровано|не удалась/.test(document.getElementById("status")!.textContent!), null, { timeout: 180000 });
+// No button: auto-calibration starts once enough varied frames are in; wait until it has been checked on new frames.
+await page.waitForFunction(() => /^Калибровка сходится|не удалась/.test(document.getElementById("status")!.textContent!), null, { timeout: 240000 });
 console.log("calibration:", await page.textContent("#status"));
 console.log((await page.textContent("#metrics"))!.replace(/\s+/g, " "));
 
@@ -94,4 +103,10 @@ await page.screenshot({ path: join(out, "live_single.png") });
 await page.evaluate((id) => ((window as unknown as { __blank: Record<string, boolean> }).__blank[id] = false), camB);
 await page.waitForTimeout(1500);
 console.log("camera B back:", await legend());
+// Bump camera B: the calibration must notice and replace itself.
+await page.evaluate((id) => ((window as unknown as { __rollDeg: Record<string, number> }).__rollDeg[id] = 4), camB);
+await page.waitForFunction(() => /сдвинули/.test(document.getElementById("status")!.textContent!), null, { timeout: 60000 });
+console.log("camera B rolled 4°:", await page.textContent("#status"));
+await page.waitForFunction(() => /^Калибровка сходится|не удалась/.test(document.getElementById("status")!.textContent!), null, { timeout: 240000 });
+console.log("after recalibration:", await page.textContent("#status"));
 await browser.close();

@@ -38,7 +38,7 @@ await page.goto("http://localhost:5180/?delegate=CPU");
 await page.waitForTimeout(1500);
 await page.click("#liveOpen");
 await page.waitForTimeout(6000);
-console.log("live:", await page.textContent("#status"), "| calibrate enabled:", await page.isEnabled("#liveCalibrate"));
+console.log("live:", await page.textContent("#status"), "| reset enabled:", await page.isEnabled("#liveReset"));
 await page.screenshot({ path: join(out, "ui_live.png") });
 
 // Calibration persistence: a synthetic record for the open fake cameras must be picked up on reopen,
@@ -50,10 +50,10 @@ const record = await page.evaluate(() => {
   };
   const I = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
   const r = {
-    format: "stereo-lab-calibration", version: 1, createdAt: new Date().toISOString(),
+    format: "stereo-lab-calibration", version: 2, createdAt: new Date().toISOString(),
     cameras: { a: dev("liveA", "videoA"), b: dev("liveB", "videoB") },
     camA: { f: 900, cx: 320, cy: 240, R: I, t: [0, 0, 0] }, camB: { f: 950, cx: 320, cy: 240, R: I, t: [1, 0, 0] },
-    view: { center: [0, 0, 3], radius: 1 }, medianReprojPx: 1.5, log: ["synthetic"],
+    view: { center: [0, 0, 3], radius: 1 }, medianReprojPx: 1.5, faceWidthUnits: 0.3, log: ["synthetic"],
   };
   localStorage.setItem("stereo-lab.calibration", JSON.stringify(r));
   return r;

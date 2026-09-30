@@ -425,6 +425,8 @@ function neckerTwin({ camA, camB }, depthA, depthB) {
 // landmarks, any origin and scale, null where absent), which settles the depth reflection.
 // bones: [[jointI, jointJ], …] of the tracked skeleton — the moving body is the calibration object.
 // groups: optional per-point detection id (e.g. "right"/"left"/"face"); a detection is accepted or rejected as a whole.
+// focalPrior: optional { fA, fB } in pixels remembered from earlier calibrations of the same devices. It is a soft
+// term: it decides along the focal valley, where the images barely constrain focal length, and gives way where they do.
 export function calibratePair(frames, sizeA, sizeB, options) {
   const {
     bones,
@@ -443,6 +445,10 @@ export function calibratePair(frames, sizeA, sizeB, options) {
     minBones = 3,
     maxStarts = 5,
     seed = 1,
+    focalPrior = {},
+    // ±5% in focal length costs as much as one reprojection residual at its sigma: small next to the data wherever the
+    // data has an opinion, decisive along the valley where LM cost differs by a few units between focal pairs.
+    focalPriorSigma = 0.05,
   } = options;
   const log = [];
   const corr = collectCorrespondences(frames, minVisibility);
@@ -489,6 +495,16 @@ export function calibratePair(frames, sizeA, sizeB, options) {
     .filter((c, i) => c.variation <= (candidates[i - 1]?.variation ?? Infinity) && c.variation <= (candidates[i + 1]?.variation ?? Infinity))
     .sort((a, b) => a.variation - b.variation)
     .slice(0, maxStarts);
+  const priorLog = [["fA", 0], ["fB", 1]].filter(([k]) => focalPrior[k]).map(([k, i]) => [i, Math.log(focalPrior[k])]);
+  if (priorLog.length) {
+    const focalsOf = (c) => [Math.log(c.intrA.f), Math.log(c.intrB.f)];
+    const nearest = candidates.reduce((a, b) => {
+      const d = (c) => priorLog.reduce((s, [i, lf]) => s + Math.abs(focalsOf(c)[i] - lf), 0);
+      return d(b) < d(a) ? b : a;
+    });
+    if (!starts.includes(nearest)) starts.push(nearest);
+    log.push(`focal prior: ${priorLog.map(([i, lf]) => `FOV_${"AB"[i]} ${fovFromFocal([sizeA, sizeB][i].width, Math.exp(lf)).toFixed(1)}°`).join(", ")}`);
+  }
   const fovs = (fa, fb) => `${fovFromFocal(sizeA.width, fa).toFixed(1)}°/${fovFromFocal(sizeB.width, fb).toFixed(1)}°`;
   log.push(`valley starts (FOV_A/FOV_B, bone variation): ${starts.map((c) => `${fovs(c.intrA.f, c.intrB.f)} ${(c.variation * 100).toFixed(1)}%`).join(", ")}`);
 
@@ -504,6 +520,7 @@ export function calibratePair(frames, sizeA, sizeB, options) {
       const pb = project(X, camB);
       for (const r of [pa[0] - c.a[0], pa[1] - c.a[1], pb[0] - c.b[0], pb[1] - c.b[1]]) out.push(huber(r / reprojSigmaPx, 2));
     }
+    for (const [i, lf] of priorLog) out.push(huber((p[i] - lf) / focalPriorSigma, 2));
     for (const track of tracks) {
       const lengths = trackLengths(frames, track, camA, camB);
       const ref = median(lengths);
@@ -515,7 +532,8 @@ export function calibratePair(frames, sizeA, sizeB, options) {
   const split = (p) => {
     const r = residuals(p);
     const sq = (xs) => xs.reduce((acc, v) => acc + v * v, 0).toFixed(0);
-    return `reproj ${sq(r.slice(0, reprojCount))} + bones ${sq(r.slice(reprojCount))}`;
+    const priorEnd = reprojCount + priorLog.length;
+    return `reproj ${sq(r.slice(0, reprojCount))}${priorLog.length ? ` + prior ${sq(r.slice(reprojCount, priorEnd))}` : ""} + bones ${sq(r.slice(priorEnd))}`;
   };
   const runs = starts.map(({ intrA, intrB, pose }) =>
     levenbergMarquardt(residuals, [Math.log(intrA.f), Math.log(intrB.f), ...vectorFromRotation(pose.R), ...anglesFromUnit(pose.t)]),
